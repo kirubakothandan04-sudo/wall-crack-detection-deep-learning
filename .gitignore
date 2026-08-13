@@ -1,0 +1,13 @@
+.DS_Store
+.venv_mac/
+.venv_predict/
+.vscode/
+.idea/
+checkpoints/
+logs/
+*.zip
+*.pages
+SDNET2018/
+.venv1/
+dataset/
+DIP/
