@@ -303,6 +303,15 @@ with tab3:
             chart_df2 = comp_df.set_index("Model Variant")[["Precision", "Recall"]]
             st.bar_chart(chart_df2)
 
+        st.markdown("---")
+        st.subheader("🎯 Confusion Matrices")
+        if os.path.exists("figures/confusion_matrices.png"):
+            st.image("figures/confusion_matrices.png", width="stretch")
+
+        st.subheader("🌡️ Gate Activation Behavior")
+        if os.path.exists("figures/gate_distribution.png"):
+            st.image("figures/gate_distribution.png", width="stretch")
+
         if "full_csaf" in available and "ungated_cross_attn" in available:
             gate_gain_f1 = (logs["full_csaf"]["test"]["f1"] - logs["ungated_cross_attn"]["test"]["f1"]) * 100
             gate_gain_recall = (logs["full_csaf"]["test"]["recall"] - logs["ungated_cross_attn"]["test"]["recall"]) * 100
