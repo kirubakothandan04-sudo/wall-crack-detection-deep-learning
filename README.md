@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # CSAF-Net: Gated Cross-Scale Attention Fusion for Wall Crack Detection
 
 A deep learning system for binary wall-crack classification that fuses **DenseNet-121** (local texture detail) and a **Vision Transformer** (global structural context) through a novel **gated bidirectional cross-attention fusion module**. The gate learns, per input, how much to trust each backbone — improving recall on real cracks over simpler fusion strategies, which matters for a safety-relevant inspection task.
@@ -107,3 +108,6 @@ python predict_csaf.py --image path/to/image.jpg --variant full_csaf
 ## Status
 
 Core architecture, all five ablation variants, and full evaluation pipeline (metrics, confusion matrices, ROC curves, gate activation analysis) are complete. Cross-domain generalization to other crack datasets is explicitly scoped as future work.
+=======
+
+>>>>>>> 0fc3d789dd1522b4309c10f1fd8e1ff25016bee2
