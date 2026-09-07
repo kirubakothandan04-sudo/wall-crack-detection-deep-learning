@@ -1,104 +1,109 @@
-# Real-Time Voice Assistant (Offline, Audio-In / Audio-Out)
+# CSAF-Net: Gated Cross-Scale Attention Fusion for Wall Crack Detection
 
-A conversational AI assistant that listens through the microphone,
-transcribes speech, generates a response, and speaks it back —
-built for the **AI Engineering Intern** take-home task.
+A deep learning system for binary wall-crack classification that fuses **DenseNet-121** (local texture detail) and a **Vision Transformer** (global structural context) through a novel **gated bidirectional cross-attention fusion module**. The gate learns, per input, how much to trust each backbone — improving recall on real cracks over simpler fusion strategies, which matters for a safety-relevant inspection task.
+
+Built for SWE3004 (VIT), with a target of IEEE ICCCNT / INDICON (IEEE Access as a journal fallback).
+
+## Why gated fusion?
+
+CNNs (DenseNet-121) excel at local texture patterns — the fine, jagged lines that define a crack. Vision Transformers excel at global context — recognizing uniform wall regions vs. irregular ones. Simply concatenating their features treats both as equally reliable for every image. **CSAF-Net's gate learns to weight them adaptively per input**, and empirically shifts toward the CNN branch specifically on crack-positive images (see gate activation analysis below).
+
+## Results
+
+Five variants were trained and evaluated on the same SDNET2018 wall-crack split (4,000 images, 70/15/15) to isolate exactly what each architectural component contributes:
+
+| Variant | Accuracy | F1 | Precision | Recall |
+|---|---|---|---|---|
+| CNN Only (DenseNet-121) | 75.33% | 73.48% | 79.46% | 68.33% |
+| ViT Only | 82.83% | 82.09% | 85.82% | 78.67% |
+| Concat Fusion (no attention) | 84.17% | 84.09% | 84.51% | 83.67% |
+| Cross-Attention (no gate) | 85.83% | 85.22% | 89.09% | 81.67% |
+| **CSAF-Net (full, gated)** | **86.00%** | **86.14%** | 85.29% | **87.00%** |
+
+**Key finding:** compared to the best non-gated alternative (cross-attention without a gate), CSAF-Net reduces missed crack detections by **29%** (55 → 39 false negatives on the test set), at the cost of a small increase in false alarms — a favorable trade-off for a safety-critical inspection system, where a missed crack is worse than a false alarm.
+
+The gate's mean activation also separates cleanly by class — averaging ~0.53 on crack-negative images vs. ~0.61 on crack-positive images — indicating the model has learned to lean on the CNN branch specifically when a crack is present, rather than applying a fixed fusion weight.
+
+All five variants share the same frozen backbones and classification head; CSAF-Net's gate adds only ~0.2M trainable parameters over the ungated cross-attention baseline (1.22M vs. 1.02M), against a shared 94M-parameter backbone.
 
 ## Architecture
 
 ```
-Mic → VAD (turn detection) → Whisper (STT) → Ollama LLM (streaming)
-    → Piper (TTS, streamed sentence-by-sentence) → Speakers
-                     |
-                     └── Fallback watchdog: plays a natural filler
-                         phrase if no audio has started within
-                         ~0.9s, so the user is never left waiting
-                         in silence.
+Input Image (224×224×3)
+        │
+   ┌────┴────┐
+   │         │
+DenseNet-121  ViT
+(local tokens) (global tokens)
+   │         │
+   └────┬────┘
+        │
+Bidirectional Cross-Attention
+ (CNN queries ViT, ViT queries CNN)
+        │
+   Learned Sigmoid Gate
+ (per-token, per-channel, conditioned
+  on both attended branches)
+        │
+   Gated Fusion
+        │
+ Classification Head
+        │
+   Crack / No Crack
 ```
 
-Everything runs **fully offline** on your machine — no API keys, no
-internet dependency at inference time (matches the brief's preference
-for an offline implementation).
+## Repository structure
 
-## 1. Setup
+| File | Purpose |
+|---|---|
+| `csaf_module.py` | Core fusion modules: `GatedCrossAttentionFusion` (full novelty), `ConcatFusion` and `UngatedCrossAttentionFusion` (ablation baselines) |
+| `csaf_net.py` | Full model assembly (`CSAFNet`, `SingleBackboneNet`) and `build_model()` factory for all 5 variants |
+| `backbones.py` | DenseNet-121 and ViT backbone wrappers |
+| `train.py` | Unified training script — trains any variant via `--variant` |
+| `evaluate.py` | Test-set evaluation, confusion matrices, ROC curves |
+| `predict_csaf.py` | Single-image inference + Canny/Hough crack analysis |
+| `app.py` | Streamlit demo app — live prediction, training analytics, ablation comparison |
+| `prepare_dataset.py` | Dataset preparation from SDNET2018 |
+| `figures/` | Generated result figures (ablation comparison, confusion matrices, ROC curves, gate visualizations, training curves) |
 
-### Install system dependencies
+## Setup
+
 ```bash
-# Ollama (runs the local LLM)
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull llama3.2:3b
-
-# Python deps
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Download the Piper voice model
+## Usage
+
+**Prepare the dataset** (expects SDNET2018 wall subset):
 ```bash
-mkdir -p models
-cd models
-wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
-wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
-cd ..
+python prepare_dataset.py
 ```
 
-### Pre-generate fallback filler audio (do this once)
+**Train a variant:**
 ```bash
-python fallback.py
+python train.py --variant full_csaf --epochs 5
 ```
-This synthesizes the filler phrases in `fallback.py` and caches them
-as `.wav` files in `fillers/`, so there's zero synthesis delay when
-the fallback is triggered at runtime.
+Variant options: `cnn_only`, `vit_only`, `concat`, `ungated_cross_attn`, `full_csaf`
 
-## 2. Run it
+**Evaluate:**
 ```bash
-python main.py
+python evaluate.py --variant full_csaf
 ```
-Speak after "Listening..." appears. The assistant detects when you
-stop talking (via VAD, not a fixed timer), transcribes, responds,
-and speaks back — logging latency for every turn to
-`latency_log.csv`.
 
-## 3. Tuning for the 2-second target
+**Run the interactive demo:**
+```bash
+streamlit run app.py
+```
 
-Latency is logged per-turn (`capture`, `stt`, `time_to_first_token`,
-`time_to_first_audio`, `total_turn`). If you're missing the budget:
+**Single-image prediction:**
+```bash
+python predict_csaf.py --image path/to/image.jpg --variant full_csaf
+```
 
-- Drop `WHISPER_MODEL_SIZE` to `"base"` or `"tiny"` in `config.py`
-- Drop `OLLAMA_MODEL` to a smaller model (e.g. `qwen2.5:1.5b`)
-- Shorten `SYSTEM_PROMPT` to force shorter replies
-- Lower `SILENCE_TIMEOUT_MS` so turn-taking feels snappier
-- If you have a GPU, set `WHISPER_DEVICE = "cuda"` and
-  `WHISPER_COMPUTE_TYPE = "float16"`
+## Dataset
 
-The `time_to_first_audio` metric is the one that matters most for
-perceived responsiveness — that's when the user actually hears
-something, which is what "within 2 seconds" should be measured against.
+[SDNET2018](https://digitalcommons.usu.edu/all_datasets/48/) — wall subset, 4,000 labeled images (crack / no-crack), split 70/15/15 for train/val/test.
 
-## 4. What makes the fallback good (not just a spinner)
+## Status
 
-Per the brief: *"keep the user engaged rather than leaving them
-waiting."* Instead of dead air or an error message, a background
-watchdog thread plays a short, pre-cached, natural-sounding filler
-("Let me think about that for a second...") if the real response
-hasn't started by ~0.9s in. Because the filler clips are pre-generated
-offline, playing one costs no extra latency of its own.
-
-## 5. Submission checklist (per the internship brief)
-
-- [ ] Upload this whole project + a short screen-recorded demo to Google Drive
-- [ ] Create a PDF listing all Drive links
-- [ ] **Disclose AI usage explicitly**, e.g.:
-  > "AI assistance (Claude) was used to scaffold the initial project
-  > architecture, pipeline wiring, and README documentation. The
-  > model selection, latency tuning, and testing were done manually."
-  > (Adjust this line to reflect what you actually did — be specific and honest.)
-- [ ] Double-check every Drive link is set to "Anyone with the link can view" before submitting
-- [ ] Include your `latency_log.csv` or a summary of your measured latencies as evidence you hit the target
-
-## Extending it further (optional, for a stronger submission)
-
-- Add barge-in support (let the user interrupt the assistant mid-reply)
-- Swap Piper for a voice-cloned model if you want a more distinctive voice
-- Add a simple web UI (e.g. with FastAPI + WebSockets) instead of a CLI loop, if the brief allows a demo interface
+Core architecture, all five ablation variants, and full evaluation pipeline (metrics, confusion matrices, ROC curves, gate activation analysis) are complete. Cross-domain generalization to other crack datasets is explicitly scoped as future work.
