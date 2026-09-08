@@ -1,14 +1,14 @@
 """
 evaluate.py
 Generates paper-ready figures:
-  1. Confusion matrices for all 5 trained variants (grid comparison)
+  1. Confusion matrices for all trained variants (grid comparison)
   2. Bar chart comparing accuracy/F1 across variants (the ablation table, visualized)
   3. Gate map visualization for full_csaf -- shows which images/regions the
      gate weights toward CNN (local) vs ViT (global) features
   4. Training curves (accuracy + loss over epochs) for full_csaf
   5. Trainable parameter count comparison across all variants
   6. Sample predictions grid -- correct AND incorrect, with confidence scores
-  7. ROC curves + AUC for all 5 variants (overlaid on one axis)
+  7. ROC curves + AUC for all variants (overlaid on one axis)
 
 Usage:
     python evaluate.py
@@ -46,12 +46,13 @@ IMAGE_SIZE = 224
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-VARIANTS = ["cnn_only", "vit_only", "concat", "ungated_cross_attn", "full_csaf"]
+VARIANTS = ["cnn_only", "vit_only", "concat", "ungated_cross_attn", "scalar_gate", "full_csaf"]
 VARIANT_LABELS = {
     "cnn_only": "CNN Only",
     "vit_only": "ViT Only",
     "concat": "Concat Fusion",
     "ungated_cross_attn": "Cross-Attn (No Gate)",
+    "scalar_gate": "Scalar Gate",
     "full_csaf": "CSAF-Net (Full, Gated)",
 }
 
@@ -97,7 +98,7 @@ def plot_confusion_matrices(device, data_dir="dataset", checkpoint_dir="checkpoi
     class_names = test_ds.classes   # ['Negative', 'Positive']
     print(f"  Test set size: {len(test_ds)} images, batch_size={loader.batch_size}")
 
-    fig, axes = plt.subplots(1, 5, figsize=(22, 4.5))
+    fig, axes = plt.subplots(1, len(VARIANTS), figsize=(4.4 * len(VARIANTS), 4.5))
 
     for ax, variant in zip(axes, VARIANTS):
         ckpt_path = os.path.join(checkpoint_dir, f"{variant}_best.pth")
@@ -330,7 +331,7 @@ def plot_training_curves(variant="full_csaf", log_dir="logs",
 
 def plot_parameter_comparison(out_path="figures/parameter_comparison.png"):
     """
-    Bar chart of trainable parameter counts across all 5 variants.
+    Bar chart of trainable parameter counts across all variants.
     Backbones are frozen by default (see backbones.py), so this mostly
     reflects the size of each fusion module + classification head --
     useful for showing CSAF-Net's gate adds negligible parameters for
@@ -457,7 +458,7 @@ def plot_sample_predictions(device, data_dir="dataset", checkpoint_dir="checkpoi
 def plot_roc_curves(device, data_dir="dataset", checkpoint_dir="checkpoints",
                      out_path="figures/roc_curves.png"):
     """
-    ROC curve + AUC for all 5 variants, overlaid on one axis.
+    ROC curve + AUC for all variants, overlaid on one axis.
     A more threshold-independent view of separability than the confusion
     matrix / accuracy-at-0.5 alone.
     """

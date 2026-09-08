@@ -9,6 +9,7 @@ Usage:
     python train.py --variant vit_only --epochs 5
     python train.py --variant concat --epochs 5
     python train.py --variant ungated_cross_attn --epochs 5
+    python train.py --variant scalar_gate --epochs 5
 
 Expects dataset/ folder from prepare_dataset.py:
     dataset/train/Positive, dataset/train/Negative
@@ -167,7 +168,8 @@ def train_model(variant, epochs=5, batch_size=8, lr=1e-4, data_dir="dataset",
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", type=str, default="full_csaf",
-                         choices=["cnn_only", "vit_only", "concat", "ungated_cross_attn", "full_csaf"])
+                         choices=["cnn_only", "vit_only", "concat", "ungated_cross_attn",
+                                  "scalar_gate", "full_csaf"])
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)

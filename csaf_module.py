@@ -8,9 +8,9 @@ This is the novelty of CSAF-Net:
 2. A learned gate, conditioned on BOTH attended outputs, decides per-token
    how much to trust the CNN-attended branch vs the ViT-attended branch.
 
-Also included: simpler fusion variants (concat, add, no-gate cross-attention)
-used for your ablation study, so all variants live in one place and share
-the same interface.
+Also included: simpler fusion variants (concat, add, no-gate cross-attention,
+scalar-gated cross-attention) used for your ablation study, so all variants
+live in one place and share the same interface.
 
 Usage:
     from csaf_module import GatedCrossAttentionFusion
@@ -151,6 +151,49 @@ class UngatedCrossAttentionFusion(nn.Module):
         return fused, None
 
 
+class ScalarGatedCrossAttentionFusion(nn.Module):
+    """
+    Ablation: same bidirectional cross-attention as the full CSAF module,
+    but the gate is a single learned scalar shared across all tokens and
+    channels, not conditioned on the input. This isolates whether the
+    gate's benefit comes from being *adaptive* per input (the full CSAF
+    claim), or simply from having *some* learned mixing weight at all.
+    """
+
+    def __init__(self, dim=256, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.cross_attn_c2v = nn.MultiheadAttention(
+            dim, num_heads, batch_first=True, dropout=dropout
+        )
+        self.cross_attn_v2c = nn.MultiheadAttention(
+            dim, num_heads, batch_first=True, dropout=dropout
+        )
+        self.norm_c2v = nn.LayerNorm(dim)
+        self.norm_v2c = nn.LayerNorm(dim)
+
+        # Single learnable scalar, initialized at 0 -> sigmoid(0) = 0.5
+        self.gate_param = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, cnn_tokens, vit_tokens):
+        attn_c2v, _ = self.cross_attn_c2v(cnn_tokens, vit_tokens, vit_tokens)
+        attn_c2v = self.norm_c2v(attn_c2v + cnn_tokens)
+
+        attn_v2c, _ = self.cross_attn_v2c(vit_tokens, cnn_tokens, cnn_tokens)
+        attn_v2c = self.norm_v2c(attn_v2c + vit_tokens)
+
+        attn_v2c_aligned = GatedCrossAttentionFusion._align_tokens(
+            attn_v2c, target_len=attn_c2v.shape[1]
+        )
+
+        gate = torch.sigmoid(self.gate_param)  # scalar in (0, 1)
+        fused = gate * attn_c2v + (1 - gate) * attn_v2c_aligned
+
+        # Broadcast to match the full CSAF gate's shape so downstream
+        # code (visualize_gate.py) doesn't need special-casing.
+        gate_map = gate.expand_as(attn_c2v)
+        return fused, gate_map
+
+
 if __name__ == "__main__":
     # smoke test with realistic shapes from backbones.py
     B, N_cnn, N_vit, dim = 2, 49, 196, 256
@@ -173,5 +216,11 @@ if __name__ == "__main__":
     ungated = UngatedCrossAttentionFusion(dim=dim)
     fused_u, _ = ungated(cnn_tokens, vit_tokens)
     print(f"  fused shape: {fused_u.shape}")   # (2, 49, 256)
+
+    print("\nTesting ScalarGatedCrossAttentionFusion (ablation)...")
+    scalar_gated = ScalarGatedCrossAttentionFusion(dim=dim)
+    fused_s, gate_s = scalar_gated(cnn_tokens, vit_tokens)
+    print(f"  fused shape: {fused_s.shape}")   # (2, 49, 256)
+    print(f"  gate value: {torch.sigmoid(scalar_gated.gate_param).item():.3f}")
 
     print("\nAll fusion variants ran successfully.")

@@ -4,8 +4,9 @@ Full CSAF-Net model: DenseNet-121 + ViT backbones -> Gated Cross-Attention
 Fusion -> classification head.
 
 Also defines lightweight wrapper models for your ablation study
-(CNN-only, ViT-only, concat, ungated cross-attention) so every variant
-shares the same backbones and head -- only the fusion strategy changes.
+(CNN-only, ViT-only, concat, ungated cross-attention, scalar-gated
+cross-attention) so every variant shares the same backbones and head --
+only the fusion strategy changes.
 
 Usage:
     from csaf_net import build_model, get_device
@@ -23,6 +24,7 @@ from csaf_module import (
     GatedCrossAttentionFusion,
     ConcatFusion,
     UngatedCrossAttentionFusion,
+    ScalarGatedCrossAttentionFusion,
 )
 
 
@@ -47,6 +49,7 @@ class ClassificationHead(nn.Module):
 class CSAFNet(nn.Module):
     """
     Full CSAF-Net: dual backbone + gated cross-scale attention fusion + head.
+
     variant controls which fusion module is used, so this one class serves
     every ablation entry except the single-backbone baselines.
     """
@@ -55,6 +58,7 @@ class CSAFNet(nn.Module):
         "full_csaf": GatedCrossAttentionFusion,
         "concat": ConcatFusion,
         "ungated_cross_attn": UngatedCrossAttentionFusion,
+        "scalar_gate": ScalarGatedCrossAttentionFusion,
     }
 
     def __init__(self, variant="full_csaf", dim=PROJ_DIM, num_heads=8,
@@ -77,9 +81,8 @@ class CSAFNet(nn.Module):
     def forward(self, images):
         cnn_tokens = self.cnn_backbone(images)   # (B, N_cnn, dim)
         vit_tokens = self.vit_backbone(images)   # (B, N_vit, dim)
-
-        fused, gate = self.fusion(cnn_tokens, vit_tokens)  # (B, N, dim), gate or None
-        logits = self.head(fused)                           # (B,)
+        fused, gate = self.fusion(cnn_tokens, vit_tokens)   # (B, N, dim), gate or None
+        logits = self.head(fused)   # (B,)
         return logits, gate
 
 
@@ -102,8 +105,8 @@ class SingleBackboneNet(nn.Module):
         self.head = ClassificationHead(dim=dim)
 
     def forward(self, images):
-        tokens = self.backbone(images)          # (B, N, dim)
-        logits = self.head(tokens)               # (B,)
+        tokens = self.backbone(images)   # (B, N, dim)
+        logits = self.head(tokens)   # (B,)
         return logits, None
 
 
@@ -112,10 +115,11 @@ def build_model(variant="full_csaf", **kwargs):
     Factory function used by train.py / run_ablations.py.
 
     variant options:
-        "cnn_only"           -> DenseNet-121 + head
-        "vit_only"           -> ViT + head
+        "cnn_only"            -> DenseNet-121 + head
+        "vit_only"            -> ViT + head
         "concat"              -> ConcatFusion ablation
-        "ungated_cross_attn" -> UngatedCrossAttentionFusion ablation
+        "ungated_cross_attn"  -> UngatedCrossAttentionFusion ablation
+        "scalar_gate"         -> ScalarGatedCrossAttentionFusion ablation
         "full_csaf"           -> full CSAF-Net (your novelty)
     """
     if variant == "cnn_only":
@@ -134,7 +138,7 @@ if __name__ == "__main__":
 
     dummy = torch.randn(2, 3, 224, 224).to(device)
 
-    for variant in ["cnn_only", "vit_only", "concat", "ungated_cross_attn", "full_csaf"]:
+    for variant in ["cnn_only", "vit_only", "concat", "ungated_cross_attn", "scalar_gate", "full_csaf"]:
         print(f"Testing variant: {variant}")
         model = build_model(variant=variant).to(device)
         model.eval()
