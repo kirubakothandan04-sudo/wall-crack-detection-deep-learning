@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
-from sklearn.metrics import confusion_matrix, roc_curve, auc
+from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_recall_curve, average_precision_score
 
 from csaf_net import build_model, get_device
 
@@ -501,6 +501,59 @@ def plot_roc_curves(device, data_dir="dataset", checkpoint_dir="checkpoints",
     print(f"Saved: {out_path}")
 
 
+def plot_pr_curves(device, data_dir="dataset", checkpoint_dir="checkpoints",
+                    out_path="figures/pr_curves.png"):
+    """
+    Precision-Recall curve for all variants, overlaid on one axis.
+
+    Unlike ROC-AUC (which was found to be nearly tied across attention-based
+    variants), the PR curve makes visible HOW EACH VARIANT TRADES PRECISION
+    FOR RECALL across the full range of thresholds -- not just at the
+    default 0.5 cutoff. This directly supports the finding that the gate's
+    contribution is a shift in operating point, not a general ranking
+    improvement (which ROC-AUC alone would suggest is absent).
+    """
+    loader, test_ds = get_test_loader(data_dir)
+
+    fig, ax = plt.subplots(figsize=(7.5, 7))
+
+    for variant in VARIANTS:
+        ckpt_path = os.path.join(checkpoint_dir, f"{variant}_best.pth")
+        if not os.path.exists(ckpt_path):
+            print(f"  Skipping {variant} -- checkpoint not found at {ckpt_path}")
+            continue
+
+        print(f"  Evaluating {variant} for PR curve...")
+        model = build_model(variant=variant).to(device)
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+
+        labels, preds, probs = get_predictions(model, loader, device)
+        precision, recall, _ = precision_recall_curve(labels, probs)
+        ap = average_precision_score(labels, probs)
+
+        ax.plot(recall, precision, linewidth=2,
+                label=f"{VARIANT_LABELS[variant]} (AP = {ap:.3f})")
+
+        del model
+        if device.type == "mps":
+            torch.mps.empty_cache()
+
+    baseline = np.mean(test_ds.targets) if hasattr(test_ds, "targets") else 0.5
+    ax.axhline(baseline, linestyle="--", color="gray",
+               label=f"Random Chance (AP = {baseline:.3f})")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("Precision-Recall Curves -- All Variants")
+    ax.legend(loc="lower left", fontsize=9)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
 if __name__ == "__main__":
     device = get_device()
     print(f"Using device: {device}\n")
@@ -525,5 +578,8 @@ if __name__ == "__main__":
 
     print("\nGenerating ROC curves for all variants...")
     plot_roc_curves(device)
+
+    print("\nGenerating Precision-Recall curves for all variants...")
+    plot_pr_curves(device)
 
     print("\nAll figures saved to figures/")

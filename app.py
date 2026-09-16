@@ -313,6 +313,15 @@ with tab3:
         if os.path.exists("figures/gate_distribution.png"):
             st.image("figures/gate_distribution.png", width="stretch")
 
+        st.subheader("📈 Precision-Recall Curves")
+        if os.path.exists("figures/pr_curves.png"):
+            st.image("figures/pr_curves.png", width="stretch")
+            st.caption(
+                "Average Precision is comparable across all attention-based variants, "
+                "confirming the gate's benefit is a shift in operating point (precision/recall "
+                "trade-off at the deployed threshold) rather than a general ranking improvement."
+            )
+
         if "full_csaf" in available and "ungated_cross_attn" in available:
             gate_gain_f1 = (logs["full_csaf"]["test"]["f1"] - logs["ungated_cross_attn"]["test"]["f1"]) * 100
             gate_gain_recall = (logs["full_csaf"]["test"]["recall"] - logs["ungated_cross_attn"]["test"]["recall"]) * 100
