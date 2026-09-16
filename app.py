@@ -10,6 +10,7 @@ import random
 import torch
 
 from predict_csaf import load_model, preprocess, analyze_crack, to_base64
+from gradcam import GradCAM, get_target_layer, overlay_heatmap, CNN_BRANCH_VARIANTS
 
 st.set_page_config(
     page_title="CSAF-Net: Wall Crack Detection & Analytics",
@@ -71,6 +72,22 @@ VARIANT_ORDER = ["cnn_only", "vit_only", "concat", "ungated_cross_attn", "scalar
 def get_cached_model(variant):
     model, device = load_model(variant=variant)
     return model, device
+
+
+@st.cache_resource(show_spinner="Preparing Grad-CAM...")
+def get_cached_gradcam_engine(variant):
+    """
+    Builds (once per variant per session) a GradCAM engine hooked onto the
+    variant's DenseNet-121 branch, reusing the already-cached model so we
+    don't load weights twice. Returns (None, None) for variants with no
+    CNN branch (vit_only).
+    """
+    if variant not in CNN_BRANCH_VARIANTS:
+        return None, None
+    model, device = get_cached_model(variant)
+    target_layer = get_target_layer(model, variant)
+    engine = GradCAM(model, target_layer)
+    return engine, device
 
 
 def run_prediction(image, variant):
@@ -188,6 +205,47 @@ with tab1:
                                 with vis_col2:
                                     st.caption("Detected Hough Crack Paths (Red)")
                                     st.image(annotated_bytes, width="stretch")
+
+                            st.markdown("---")
+                            st.subheader("Grad-CAM: Where the CNN Branch Looks")
+                            if selected_variant not in CNN_BRANCH_VARIANTS:
+                                st.caption(
+                                    "Grad-CAM isn't available for ViT Only -- it has no "
+                                    "DenseNet-121 branch to visualize."
+                                )
+                            else:
+                                show_gradcam = st.checkbox(
+                                    "Compute Grad-CAM for this image", key="show_gradcam"
+                                )
+                                if show_gradcam:
+                                    with st.spinner("Computing Grad-CAM..."):
+                                        try:
+                                            gc_engine, gc_device = get_cached_gradcam_engine(selected_variant)
+                                            from torchvision import transforms as _t
+                                            _IMAGE_SIZE = 224
+                                            _MEAN = [0.485, 0.456, 0.406]
+                                            _STD = [0.229, 0.224, 0.225]
+                                            gc_transform = _t.Compose([
+                                                _t.Resize((_IMAGE_SIZE, _IMAGE_SIZE)),
+                                                _t.ToTensor(),
+                                                _t.Normalize(_MEAN, _STD),
+                                            ])
+                                            gc_tensor = gc_transform(image).unsqueeze(0)
+                                            cam, gc_confidence = gc_engine.generate(gc_tensor, gc_device)
+                                            overlay = overlay_heatmap(cam, image)
+                                            st.image(
+                                                overlay,
+                                                caption=f"CNN branch attention (confidence: {gc_confidence*100:.1f}%)",
+                                                width="stretch",
+                                            )
+                                            st.caption(
+                                                "Highlights the region the DenseNet-121 branch focused on for "
+                                                "this prediction. The final decision also incorporates the "
+                                                "ViT branch and the learned gate, so this shows only one "
+                                                "branch's contribution, not the full model's reasoning."
+                                            )
+                                        except Exception as e_cam:
+                                            st.error(f"Grad-CAM failed: {e_cam}")
 
                             st.markdown("---")
                             if st.button("Apply Augmentation & Predict Again"):
