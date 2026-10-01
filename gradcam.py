@@ -49,11 +49,39 @@ def get_target_layer(model, variant):
     """
     Returns the DenseNet-121 conv stack to hook Grad-CAM onto, for a given
     built model + variant name. Raises if the variant has no CNN branch.
+
+    This is the FINAL feature map (7x7 spatial resolution at 224x224 input)
+    -- good semantic signal, coarse localization. Use get_fine_target_layer
+    for a higher-resolution (but slightly less semantic) alternative, e.g.
+    for the combined Grad-CAM + Canny segmentation, where spatial precision
+    matters more than semantic strength.
     """
     if variant == "cnn_only":
         return model.backbone.features
     elif variant in CNN_BRANCH_VARIANTS:
         return model.cnn_backbone.features
+    else:
+        raise ValueError(
+            f"Grad-CAM needs a DenseNet-121 branch; variant '{variant}' has none "
+            f"(e.g. vit_only). Choose from: {CNN_BRANCH_VARIANTS}"
+        )
+
+
+def get_fine_target_layer(model, variant):
+    """
+    Returns an EARLIER DenseNet-121 block (denseblock3, before the final
+    downsampling transition) -- 14x14 spatial resolution at 224x224 input,
+    double the final layer's 7x7. Each cell covers a ~16x16 pixel region
+    instead of ~32x32, so a thin crack and a nearby window frame are less
+    likely to fall inside the same cell and get conflated. Semantic
+    strength is slightly weaker this early in the network, which is why
+    this is used only where precise localization matters (segmentation),
+    not for the primary Grad-CAM confidence display.
+    """
+    if variant == "cnn_only":
+        return model.backbone.features.denseblock3
+    elif variant in CNN_BRANCH_VARIANTS:
+        return model.cnn_backbone.features.denseblock3
     else:
         raise ValueError(
             f"Grad-CAM needs a DenseNet-121 branch; variant '{variant}' has none "
@@ -135,6 +163,93 @@ def overlay_heatmap(cam, original_pil_image, alpha=0.45, image_size=IMAGE_SIZE):
     orig_resized = np.array(original_pil_image.resize((image_size, image_size)).convert("RGB"))
     overlay = (alpha * heatmap_color + (1 - alpha) * orig_resized).astype(np.uint8)
     return overlay
+
+
+def combined_crack_mask(cam, original_pil_image, image_size=IMAGE_SIZE,
+                         cam_percentile=80, canny_low=50, canny_high=150,
+                         dilate_iterations=1, mask_color=(0, 255, 0)):
+    """
+    Heuristic pixel-level crack mask combining TWO independently computed
+    signals -- Grad-CAM (where the CNN branch attends) and Canny edges
+    (where actual sharp intensity discontinuities are) -- rather than a
+    trained segmentation model, which would require pixel-mask annotations
+    this project's dataset (SDNET2018) does not provide.
+
+    Rationale: Canny alone fires on every hard edge in a scene (window
+    frames, brick coursing, architectural lines), which is far too noisy
+    on a full facade. Grad-CAM alone is coarse (a 7x7 grid upsampled),
+    giving only a rough region, not a precise outline. Intersecting them
+    -- "only count edge pixels that also fall inside the model's attended
+    region" -- keeps edges the model actually cares about and discards
+    edges elsewhere in the frame, giving a materially tighter, more
+    trustworthy outline than either signal alone.
+
+    Returns:
+        overlay: (image_size, image_size, 3) uint8 RGB array, the original
+            image with surviving mask pixels highlighted in mask_color
+        mask: (image_size, image_size) bool array, the final combined mask
+    """
+    # 1. Upsample the low-res CAM and threshold to a "high attention" region.
+    cam_resized = cv2.resize(cam, (image_size, image_size))
+    if cam_resized.max() > 0:
+        cam_resized = cam_resized / cam_resized.max()
+    threshold_val = np.percentile(cam_resized, cam_percentile)
+    attended_mask = cam_resized >= threshold_val
+
+    # 2. Compute Canny edges on the same crop at the same resolution.
+    img_resized = np.array(original_pil_image.resize((image_size, image_size)).convert("RGB"))
+    gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, canny_low, canny_high)
+    if dilate_iterations > 0:
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=dilate_iterations)
+    edge_mask = edges > 0
+
+    # 3. Intersection: only keep edges that fall inside the attended region.
+    combined_mask = edge_mask & attended_mask
+
+    overlay = img_resized.copy()
+    overlay[combined_mask] = mask_color
+
+    return overlay, combined_mask
+
+
+def mask_linearity_score(mask, min_contour_area=15):
+    """
+    Measures whether a binary mask (e.g. from combined_crack_mask) looks
+    like a thin, elongated LINE (consistent with a real crack) or a
+    blocky, roughly square/rectangular REGION (consistent with a window
+    frame, stone block, or other architectural feature).
+
+    For each connected component in the mask, fits a minimum-area
+    rotated rectangle and computes its aspect ratio (long side / short
+    side). A thin crack line produces a high aspect ratio (long and
+    narrow); a window frame's outline or a blocky texture patch produces
+    a low aspect ratio (closer to square).
+
+    Returns the MAXIMUM aspect ratio found across components -- i.e. "is
+    there at least one clearly line-like structure in this mask" -- since
+    a real crack only needs to be present once, while non-crack clutter
+    (e.g. a window frame outline) can coexist in the same mask.
+
+    This is a simple geometric heuristic, not a learned classifier of
+    "crack-shaped vs not" -- it estimates elongation from pixel geometry,
+    nothing more.
+    """
+    mask_uint8 = (mask.astype(np.uint8)) * 255
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    max_aspect = 0.0
+    for cnt in contours:
+        if cv2.contourArea(cnt) < min_contour_area:
+            continue
+        rect = cv2.minAreaRect(cnt)
+        (_, _), (w, h), _ = rect
+        short_side = max(min(w, h), 1e-6)
+        long_side = max(w, h)
+        aspect = long_side / short_side
+        max_aspect = max(max_aspect, aspect)
+
+    return max_aspect
 
 
 def get_test_transform():
