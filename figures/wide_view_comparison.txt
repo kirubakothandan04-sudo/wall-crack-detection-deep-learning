@@ -1,0 +1,20 @@
+Whole Image vs Wide View
+Seed: 42
+Positive canvases: 20
+Negative canvases: 20
+Canvas size: 900
+Tile size: 224
+Threshold: 0.99
+Stride: 112
+IoU threshold: 0.3
+
+WHOLE IMAGE
+{'TP': 2, 'FN': 18, 'FP': 0, 'TN': 20, 'accuracy': 0.55, 'precision': 1.0, 'recall': 0.1, 'f1': 0.18181818181818182}
+
+WIDE VIEW ANY DETECTION
+{'TP': 18, 'FN': 2, 'FP': 3, 'TN': 17, 'accuracy': 0.875, 'precision': 0.8571428571428571, 'recall': 0.9, 'f1': 0.8780487804878048}
+
+WIDE VIEW LOCALIZATION
+{'TP': 16, 'FN': 4, 'FP': 3, 'TN': 17, 'accuracy': 0.825, 'precision': 0.8421052631578947, 'recall': 0.8, 'f1': 0.8205128205128205}
+
+Average best IoU: 0.7000
