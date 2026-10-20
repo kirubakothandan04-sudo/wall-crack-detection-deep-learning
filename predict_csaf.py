@@ -72,7 +72,7 @@ def analyze_crack(image):
         angles = []
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            cv2.line(annotated_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            cv2.line(annotated_img, (x1, y1), (x2, y2), (255, 0, 0), 3)
             if x2 - x1 != 0:
                 angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
                 angles.append(angle)

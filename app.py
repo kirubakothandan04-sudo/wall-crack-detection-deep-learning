@@ -6,6 +6,7 @@ import json
 import os
 import base64
 import glob
+import hashlib
 import pandas as pd
 import random
 import torch
@@ -162,6 +163,32 @@ def load_training_logs():
     return logs
 
 
+def load_multi_run_stats(variants):
+    """
+    For each variant, collects the test metrics of the original run (logs/) plus
+    any seeded reruns saved by run_seeds.py under ~/csaf_seeds/logs/seed*/.
+    Returns {variant: [test_metrics_dict, ...]} only for variants with 2+ runs.
+    """
+    root = os.path.expanduser("~/csaf_seeds")
+    out = {}
+    for v in variants:
+        paths = [f"logs/{v}_log.json"] + sorted(
+            glob.glob(os.path.join(root, "logs", "seed*", f"{v}_log.json"))
+        )
+        runs = []
+        for p in paths:
+            if os.path.exists(p):
+                with open(p) as f:
+                    runs.append(json.load(f)["test"])
+        if len(runs) > 1:
+            out[v] = runs
+    return out
+
+
+def run_mean(runs, key):
+    return float(np.mean([r[key] for r in runs]))
+
+
 VARIANT_LABELS = {
     "cnn_only": "CNN Only (DenseNet-121)",
     "vit_only": "ViT Only",
@@ -260,6 +287,62 @@ def run_prediction(image, variant):
     return result
 
 
+def compute_occlusion_heat(image, variant, win=32, stride=16):
+    """
+    Whole-model occlusion map: how much the crack logit drops when a square of the
+    (224x224-resized) image is replaced by the dataset-mean colour. Works for every
+    variant because it only needs the model's output. Cached per image and variant.
+    """
+    key = (variant, hashlib.md5(image.tobytes()).hexdigest(), win, stride)
+    cache = st.session_state.setdefault("occ_cache", {})
+    if key in cache:
+        return cache[key]
+
+    from torchvision import transforms
+    model, device = get_cached_model(variant)
+    tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    x = tf(image).unsqueeze(0).to(device)
+    pos = [(i, j) for i in range(0, 224 - win + 1, stride) for j in range(0, 224 - win + 1, stride)]
+    heat = np.zeros((224, 224))
+    cnt = np.zeros((224, 224))
+    with torch.no_grad():
+        base = model(x)[0].item()
+        for s in range(0, len(pos), 32):
+            chunk = pos[s:s + 32]
+            xb = x.repeat(len(chunk), 1, 1, 1)
+            for k, (i, j) in enumerate(chunk):
+                xb[k, :, i:i + win, j:j + win] = 0.0
+            drops = (base - model(xb)[0]).cpu().numpy()
+            for (i, j), d in zip(chunk, drops):
+                heat[i:i + win, j:j + win] += d
+                cnt[i:i + win, j:j + win] += 1
+    heat = np.maximum(heat / np.maximum(cnt, 1), 0)
+    if heat.max() > 0:
+        heat = heat / heat.max()
+    cache[key] = heat
+    return heat
+
+
+def render_occlusion(image, variant):
+    with st.spinner("Computing occlusion map..."):
+        heat = compute_occlusion_heat(image, variant)
+    st.image(
+        overlay_heatmap(heat, image),
+        caption=f"Whole-model occlusion map ({VARIANT_LABELS.get(variant, variant)})",
+        width="stretch",
+    )
+    st.caption(
+        "Shows how much the crack score drops when each square is hidden, using the full model "
+        "(CNN branch, ViT branch and gate). On 25 annotated images its strongest point fell near the "
+        "drawn crack in 84% of cases, versus 36% for the CNN-branch Grad-CAM above. It shows where the "
+        "model's output is sensitive, not proof of how it reasons."
+    )
+
+
 # Tabs structure
 tab1, tab2, tab3 = st.tabs([
     "🔍 Live Prediction", "📊 Model Training Analytics", "⚔️ Ablation Comparison"
@@ -289,8 +372,8 @@ with tab1:
         )
 
         # ------------------------------------------------------------------
-        # MODE 1: Single Crop -- same behavior as before (prediction,
-        # Canny/Hough, Grad-CAM, augmentation retry) on one 224x224 patch.
+        # MODE 1: Single Crop -- prediction, Canny/Hough, Grad-CAM, occlusion,
+        # augmentation retry on one 224x224 patch.
         # ------------------------------------------------------------------
         if scan_mode == "Single Crop (pre-cropped wall patch)":
             uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"], key="single_uploader")
@@ -345,9 +428,13 @@ with tab1:
                                     with vis_col2:
                                         st.caption("Detected Hough Crack Paths (Red)")
                                         st.image(annotated_bytes, width="stretch")
+                                    st.caption(
+                                        "Canny/Hough marks any strong straight edge (window frames, door edges, "
+                                        "wires as well as cracks), so treat it as auxiliary analysis only."
+                                    )
 
                                 st.markdown("---")
-                                st.subheader("Grad-CAM: Where the CNN Branch Looks")
+                                st.subheader("Grad-CAM: CNN Branch Only (Coarse)")
                                 if selected_variant not in CNN_BRANCH_VARIANTS:
                                     st.caption(
                                         "Grad-CAM isn't available for ViT Only -- it has no "
@@ -375,13 +462,41 @@ with tab1:
                                                 width="stretch",
                                             )
                                             st.caption(
-                                                "Highlights the region the DenseNet-121 branch focused on for "
-                                                "this prediction. The final decision also incorporates the "
-                                                "ViT branch and the learned gate, so this shows only one "
-                                                "branch's contribution, not the full model's reasoning."
-                                                )
+                                                "Shows where the DenseNet-121 branch is sensitive, on a coarse 7x7 grid. "
+                                                "The final decision also uses the ViT branch and the learned gate, and "
+                                                "this map is image-dependent: it does not always coincide with the crack "
+                                                "(compare with the whole-model occlusion map below)."
+                                            )
                                         except Exception as e_cam:
                                             st.error(f"Grad-CAM failed: {e_cam}")
+
+                                st.markdown("---")
+                                st.subheader("Pixel-Level Crack Localization")
+                                st.info(
+                                    "ℹ️ **Important**: CSAF-Net is a **classification model** trained on image-level labels "
+                                    "(crack/no-crack), not pixel-level crack annotations. It classifies whether a crop contains "
+                                    "a crack but **does not provide validated pixel-level segmentation**."
+                                )
+                                st.write(
+                                    "**Why pixel-level localization is not available:**\n"
+                                    "- The model was trained on SDNET2018, which has image-level labels only (no pixel masks)\n"
+                                    "- CNN attention (shown in Grad-CAM above) indicates decision-relevant regions — texture, "
+                                    "context, edges — not precise crack boundaries\n"
+                                    "- Attention is typically diffuse across ~20% of the image, not focal on crack pixels\n"
+                                    "- Intersection of attention and edge detection produces blocky patches, not thin crack lines"
+                                )
+                                st.write(
+                                    "**For reliable pixel-level crack localization:**\n"
+                                    "A dedicated segmentation model (U-Net, Mask R-CNN, DeepLabV3+) trained on pixel-annotated "
+                                    "crack masks would be necessary. This requires a dataset with ground-truth crack boundaries "
+                                    "drawn at the pixel level, not just image-level crack/no-crack labels."
+                                )
+
+                                st.subheader("Occlusion: Where the Whole Model Is Sensitive")
+                                try:
+                                    render_occlusion(image, selected_variant)
+                                except Exception as e_occ:
+                                    st.error(f"Occlusion map failed: {e_occ}")
 
                                 st.markdown("---")
                                 if st.button("Apply Augmentation & Predict Again"):
@@ -415,7 +530,7 @@ with tab1:
 
         # ------------------------------------------------------------------
         # MODE 2: Wide-Photo Scan -- localization stage (sliding window)
-        # + dual verification (Canny/Hough + Grad-CAM) per detected region.
+        # + verification (Canny/Hough + Grad-CAM + shape check) per region.
         # Reuses the same trained classifier selected above; no retraining.
         # ------------------------------------------------------------------
         else:
@@ -431,25 +546,23 @@ with tab1:
             st.info(
                 "⚠️ Known limitation: since the classifier has only ever seen wall texture "
                 "(never text, objects, or fixtures), it can mistake high-contrast edges in "
-                "printed text, screws, or fittings for cracks. This is a dataset-coverage "
-                "limitation, not a bug -- see the Verify section below and the project's "
-                "Future Work discussion."
+                "printed text, screws, window frames or fittings for cracks. This is a "
+                "dataset-coverage limitation, not a bug -- see the Verify section below and "
+                "the project's Future Work discussion."
             )
 
             sw_use_ensemble = st.checkbox(
                 "Use ensemble mode (require agreement across multiple trained models)",
-                value=True, key="sw_use_ensemble",
+                value=False, key="sw_use_ensemble",
             )
             if sw_use_ensemble:
                 st.caption(
                     f"Ensemble mode polls **{', '.join(VARIANT_LABELS.get(v, v) for v in DEFAULT_ENSEMBLE_VARIANTS)}** "
                     "on every window (ignoring the model dropdown above) and only keeps a "
                     "detection when enough of them independently agree it's a crack. "
-                    "Different architectures tend to be fooled by different things -- a "
-                    "window frame that fools the fused model may not fool the single-backbone "
-                    "models -- so requiring agreement can filter out some false positives a "
-                    "single model would keep. This runs 3 full models per window, so scanning "
-                    "is noticeably slower."
+                    "On our synthetic benchmark this did not improve crack localization over the "
+                    "single model, so it is off by default. It runs 3 full models per window, "
+                    "so scanning is noticeably slower."
                 )
                 sw_min_agree = st.slider(
                     "Minimum models that must agree", 1, len(DEFAULT_ENSEMBLE_VARIANTS),
@@ -460,9 +573,10 @@ with tab1:
             with sw_col1:
                 sw_threshold = st.slider(
                     "Confidence threshold (per model)" if sw_use_ensemble else "Confidence threshold",
-                    0.50, 0.99,
-                    0.90 if sw_use_ensemble else 0.99,
-                    0.01,
+                    0.50, 0.999,
+                    0.93 if sw_use_ensemble else 0.995,
+                    0.005,
+                    format="%.3f",
                     key="sw_threshold_ens" if sw_use_ensemble else "sw_threshold_single",
                 )
             with sw_col2:
@@ -470,6 +584,10 @@ with tab1:
                     "Window stride (px) -- smaller = more thorough, slower",
                     56, 224, 112, 8, key="sw_stride"
                 )
+            st.caption(
+                "Defaults come from a validation-tuned benchmark: 0.995 for the single model and 0.93 for "
+                "the ensemble. Lower thresholds find more cracks but add many false boxes."
+            )
 
             sw_use_wall_filter = st.checkbox(
                 "Filter out non-wall backgrounds (sky, paper, flat surfaces)",
@@ -682,9 +800,10 @@ with tab1:
                             "∩ Canny) contains an elongated, line-like structure versus a blocky "
                             "region typical of window surrounds or stonework; Risk is downgraded to "
                             "'Unclear' when no linear shape is found, regardless of classifier "
-                            "confidence. None of this is a calibrated structural risk score -- treat "
-                            "it as a prioritization aid for manual inspection, not an engineering "
-                            "assessment."
+                            "confidence. Shape and Risk depend on the CNN-branch attention map, which "
+                            "in our 25-image check fell near the drawn crack only about 20% of the time "
+                            "at this resolution, so treat them as prioritization hints for manual "
+                            "inspection, not as crack evidence or an engineering assessment."
                         )
                     else:
                         st.info("No crack regions detected above the current threshold.")
@@ -693,13 +812,13 @@ with tab1:
                         st.markdown("---")
                         st.subheader("🔬 Verify Each Detected Region")
                         st.write(
-                            "Each box is cross-checked: **Canny/Hough crack-type analysis** (the "
-                            "same geometric check used above in Single Crop mode), **Grad-CAM** "
-                            "(where the CNN branch focused), and a **Shape check** (does the "
-                            "segmentation mask form a line, or a blocky region?). Regions where "
-                            "all three agree are more trustworthy; disagreement -- e.g. high "
-                            "confidence but a blocky, non-linear mask -- is a useful signal to "
-                            "flag for human review rather than trust automatically."
+                            "Each box is shown with three auxiliary checks: **Canny/Hough crack-type "
+                            "analysis** (the same geometric check used in Single Crop mode), **Grad-CAM** "
+                            "(where the CNN branch is sensitive) and a **Shape check** (does the "
+                            "segmentation mask form a line, or a blocky region?). These checks can "
+                            "disagree with each other and with the classifier -- e.g. high "
+                            "confidence but a blocky, non-linear mask -- which is a useful signal to "
+                            "flag a region for human review rather than trust it automatically."
                         )
 
                         for i, (d, pre) in enumerate(zip(detections, per_detection), start=1):
@@ -749,15 +868,13 @@ with tab1:
                             "**Segmentation column**: a heuristic pixel mask, not a trained "
                             "segmentation model (SDNET2018 has no pixel-level crack annotations "
                             "to train one). It keeps only the Canny edge pixels that also fall "
-                            "inside the model's high-attention region -- computed from an "
-                            "earlier DenseNet-121 block (14×14 resolution) rather than the "
-                            "final 7×7 layer used for the Grad-CAM column, since finer spatial "
-                            "resolution reduces conflating a thin crack with a nearby window "
-                            "frame in the same attention cell. **Shape** fits a rotated bounding "
-                            "box to the mask and reports its long/short side ratio -- a real "
+                            "inside the CNN branch's high-attention region, computed from an "
+                            "earlier DenseNet-121 block (14×14 resolution). **Shape** fits a rotated "
+                            "bounding box to the mask and reports its long/short side ratio -- a real "
                             "crack tends to be thin and elongated, while a window frame or "
                             "texture patch tends to be blocky. Both are heuristic combinations "
-                            "of existing signals, not a learned segmentation or shape model; a "
+                            "of existing signals, not a learned segmentation or shape model, and "
+                            "the CNN-branch attention they rely on is not always on the crack; a "
                             "model trained on real pixel-mask annotations would be more precise "
                             "and is noted as Future Work."
                         )
@@ -795,6 +912,7 @@ with tab2:
 
         st.markdown("---")
         st.subheader("📋 Evaluation Summary (Test Dataset) — CSAF-Net (Full, Gated)")
+        st.caption("Original training run; see the Ablation Comparison tab for mean ± std over repeated runs.")
 
         test_metrics = logs["full_csaf"]["test"]
         mcol1, mcol2, mcol3, mcol4 = st.columns(4)
@@ -805,25 +923,40 @@ with tab2:
 
 with tab3:
     st.title("⚔️ Ablation Comparison")
-    st.write("Comparing all fusion strategies tested in this project. This is the core evidence "
-             "for CSAF-Net's novelty: the gated fusion module outperforms every simpler alternative.")
+    st.write("Comparing all fusion strategies tested in this project. Fusing both backbones clearly beats "
+             "the CNN alone. Over repeated runs, the gate raises recall over ungated cross-attention at "
+             "lower precision, while F1 and accuracy are not meaningfully different (see the mean ± std "
+             "table below).")
 
     logs = load_training_logs()
     available = [v for v in VARIANT_ORDER if v in logs]
+    multi = load_multi_run_stats(["ungated_cross_attn", "scalar_gate", "full_csaf"])
 
     if not available:
         st.warning("No training logs found. Run train.py for each variant first.")
     else:
         if "full_csaf" in available:
             hc1, hc2, hc3, hc4 = st.columns(4)
-            fc_metrics = logs["full_csaf"]["test"]
-            metric_card(hc1, "Best Accuracy", f"{fc_metrics['accuracy']*100:.2f}%")
-            metric_card(hc2, "Best F1-Score", f"{fc_metrics['f1']*100:.2f}%")
-            metric_card(hc3, "Best Recall", f"{fc_metrics['recall']*100:.2f}%")
-            if "ungated_cross_attn" in available:
-                fn_reduction = (1 - (1 - fc_metrics["recall"]) /
-                                (1 - logs["ungated_cross_attn"]["test"]["recall"])) * 100
-                metric_card(hc4, "Fewer Missed Cracks", f"-{fn_reduction:.0f}%")
+            if "full_csaf" in multi:
+                fm = multi["full_csaf"]
+                n_f = len(fm)
+                metric_card(hc1, f"Mean Accuracy ({n_f} runs)", f"{run_mean(fm, 'accuracy')*100:.2f}%")
+                metric_card(hc2, f"Mean F1-Score ({n_f} runs)", f"{run_mean(fm, 'f1')*100:.2f}%")
+                metric_card(hc3, f"Mean Recall ({n_f} runs)", f"{run_mean(fm, 'recall')*100:.2f}%")
+                if "ungated_cross_attn" in multi:
+                    miss_f = 1 - run_mean(fm, "recall")
+                    miss_u = 1 - run_mean(multi["ungated_cross_attn"], "recall")
+                    fn_reduction = (1 - miss_f / miss_u) * 100
+                    metric_card(hc4, "Missed Cracks vs Ungated (mean)", f"{-fn_reduction:+.0f}%")
+            else:
+                fc_metrics = logs["full_csaf"]["test"]
+                metric_card(hc1, "Accuracy (original run)", f"{fc_metrics['accuracy']*100:.2f}%")
+                metric_card(hc2, "F1-Score (original run)", f"{fc_metrics['f1']*100:.2f}%")
+                metric_card(hc3, "Recall (original run)", f"{fc_metrics['recall']*100:.2f}%")
+                if "ungated_cross_attn" in available:
+                    fn_reduction = (1 - (1 - fc_metrics["recall"]) /
+                                    (1 - logs["ungated_cross_attn"]["test"]["recall"])) * 100
+                    metric_card(hc4, "Missed Cracks vs Ungated (1 run)", f"{-fn_reduction:+.0f}%")
             st.markdown("<br>", unsafe_allow_html=True)
 
         comparison_data = {
@@ -838,7 +971,27 @@ with tab3:
         display_df = comp_df.copy()
         for col in ["Accuracy", "F1-Score", "Precision", "Recall"]:
             display_df[col] = (display_df[col] * 100).round(2).astype(str) + "%"
+        st.subheader("Original training run (one run per variant)")
         st.table(display_df.set_index("Model Variant"))
+
+        if multi:
+            ms_rows = []
+            for v in ["ungated_cross_attn", "scalar_gate", "full_csaf"]:
+                if v in multi:
+                    runs = multi[v]
+                    row = {"Model Variant": VARIANT_LABELS[v], "Runs": len(runs)}
+                    for key, name in (("accuracy", "Accuracy"), ("precision", "Precision"),
+                                      ("recall", "Recall"), ("f1", "F1-Score")):
+                        vals = np.array([r[key] for r in runs]) * 100
+                        row[name] = f"{vals.mean():.2f} ± {vals.std(ddof=1):.2f}"
+                    ms_rows.append(row)
+            st.subheader("Mean ± std over repeated runs")
+            st.table(pd.DataFrame(ms_rows).set_index("Model Variant"))
+            st.caption(
+                "Original run plus seeded reruns (saved in ~/csaf_seeds). CNN-only, ViT-only and "
+                "concatenation were trained once. With only a few runs per variant, treat differences "
+                "smaller than the ± values as noise."
+            )
 
         st.markdown("---")
 
@@ -862,6 +1015,13 @@ with tab3:
         st.subheader("🌡️ Gate Activation Behavior")
         if os.path.exists("figures/gate_distribution.png"):
             st.image("figures/gate_distribution.png", width="stretch")
+        if os.path.exists("figures/gate_analysis.png"):
+            st.image("figures/gate_analysis.png", width="stretch")
+            st.caption(
+                "Learned gate on the 600 test images (1 = CNN-attended branch, 0 = ViT-attended branch). "
+                "The mean gate is higher for cracked images, but it is nearly uniform across spatial "
+                "position: the gate is input-conditioned and channel-wise."
+            )
 
         st.subheader("📈 Precision-Recall Curves")
         if os.path.exists("figures/pr_curves.png"):
@@ -872,28 +1032,40 @@ with tab3:
                 "trade-off at the deployed threshold) rather than a general ranking improvement."
             )
 
-        if "full_csaf" in available and "ungated_cross_attn" in available:
+        if "full_csaf" in multi and "ungated_cross_attn" in multi:
+            fm, um = multi["full_csaf"], multi["ungated_cross_attn"]
+            st.markdown("---")
+            finding_card(
+                "Effect of the Gate",
+                f"Over {len(fm)} runs, the gate changes mean recall from "
+                f"<strong>{run_mean(um, 'recall')*100:.1f}%</strong> (ungated cross-attention) to "
+                f"<strong>{run_mean(fm, 'recall')*100:.1f}%</strong> and mean precision from "
+                f"<strong>{run_mean(um, 'precision')*100:.1f}%</strong> to "
+                f"<strong>{run_mean(fm, 'precision')*100:.1f}%</strong>. Mean F1 is "
+                f"{run_mean(fm, 'f1')*100:.1f} vs {run_mean(um, 'f1')*100:.1f}, within run-to-run "
+                f"variation, so the gate shifts the operating point toward fewer missed cracks "
+                f"rather than improving overall accuracy."
+            )
+        elif "full_csaf" in available and "ungated_cross_attn" in available:
             gate_gain_f1 = (logs["full_csaf"]["test"]["f1"] - logs["ungated_cross_attn"]["test"]["f1"]) * 100
             gate_gain_recall = (logs["full_csaf"]["test"]["recall"] - logs["ungated_cross_attn"]["test"]["recall"]) * 100
             st.markdown("---")
             finding_card(
-                "Effect of the Gate",
-                f"Adding the learned gate on top of bidirectional cross-attention improves F1 by "
-                f"<strong>{gate_gain_f1:+.2f} points</strong> and recall by "
-                f"<strong>{gate_gain_recall:+.2f} points</strong> compared to ungated cross-attention "
-                f"fusion — isolating the exact contribution of CSAF-Net's novelty."
+                "Effect of the Gate (single run)",
+                f"In the original run the gate changes recall by <strong>{gate_gain_recall:+.2f} points</strong> "
+                f"and F1 by <strong>{gate_gain_f1:+.2f} points</strong> versus ungated cross-attention. "
+                f"One run per variant cannot separate a real effect from run-to-run variation; "
+                f"repeat training with different seeds before drawing conclusions."
             )
 
-        if "scalar_gate" in available and "full_csaf" in available and "ungated_cross_attn" in available:
-            scalar_vs_ungated_f1 = (logs["scalar_gate"]["test"]["f1"] - logs["ungated_cross_attn"]["test"]["f1"]) * 100
-            full_vs_scalar_f1 = (logs["full_csaf"]["test"]["f1"] - logs["scalar_gate"]["test"]["f1"]) * 100
+        if "full_csaf" in multi and "scalar_gate" in multi and "ungated_cross_attn" in multi:
             finding_card(
-                "Why an Adaptive (Per-Token) Gate?",
-                f"A single, input-independent scalar gate already improves F1 by "
-                f"<strong>{scalar_vs_ungated_f1:+.2f} points</strong> over no gate at all, confirming "
-                f"that <em>having</em> a learned mixing weight helps. But making that gate "
-                f"<strong>adaptive per input token</strong> (CSAF-Net's actual design) adds a further "
-                f"<strong>{full_vs_scalar_f1:+.2f} points</strong> of F1 on top of the scalar gate — "
-                f"showing the benefit comes specifically from the gate's input-conditioned flexibility, "
-                f"not merely its presence."
+                "Is an Input-Conditioned Channel-wise Gate Needed?",
+                f"Mean recall: full gate <strong>{run_mean(multi['full_csaf'], 'recall')*100:.1f}%</strong>, "
+                f"scalar gate <strong>{run_mean(multi['scalar_gate'], 'recall')*100:.1f}%</strong>, "
+                f"no gate <strong>{run_mean(multi['ungated_cross_attn'], 'recall')*100:.1f}%</strong>. "
+                f"Compare the differences with the ± values in the table above before reading anything "
+                f"into the ordering: the full-vs-scalar gap is within run-to-run variation, so the benefit "
+                f"of making the gate adaptive is not established. The learned gate varies across channels "
+                f"and responds to crack presence, but not across spatial position."
             )

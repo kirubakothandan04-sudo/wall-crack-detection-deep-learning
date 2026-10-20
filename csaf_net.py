@@ -111,17 +111,7 @@ class SingleBackboneNet(nn.Module):
 
 
 def build_model(variant="full_csaf", **kwargs):
-    """
-    Factory function used by train.py / run_ablations.py.
 
-    variant options:
-        "cnn_only"            -> DenseNet-121 + head
-        "vit_only"            -> ViT + head
-        "concat"              -> ConcatFusion ablation
-        "ungated_cross_attn"  -> UngatedCrossAttentionFusion ablation
-        "scalar_gate"         -> ScalarGatedCrossAttentionFusion ablation
-        "full_csaf"           -> full CSAF-Net (your novelty)
-    """
     if variant == "cnn_only":
         return SingleBackboneNet(backbone_type="cnn", **kwargs)
     elif variant == "vit_only":

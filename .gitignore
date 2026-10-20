@@ -11,3 +11,9 @@ SDNET2018/
 .venv1/
 dataset/
 DIP/
+.venv*
+checkpoints*/
+SDNET2018/
+real_data/
+__pycache__/
+.DS_Store
